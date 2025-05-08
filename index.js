@@ -1,115 +1,125 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const { OpenAI } = require('openai');
-const fs = require('fs');
 const axios = require('axios');
 const { exec } = require('child_process');
-
+const fs = require('fs');
+const path = require('path');
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
 
-let memory = {};
+let memory = {}; // simple memory storage
 
-// 🔹 Command: /start
+// /start and /shadow command
 bot.start((ctx) => {
-  ctx.reply(`👋 Welcome to SHADOW — your personal AI assistant.`);
+  ctx.reply(`👋 Welcome to *Shadow AI*, your personal assistant. Type anything!`, { parse_mode: 'Markdown' });
 });
+bot.hears('shadow', (ctx) => ctx.reply('🔮 Shadow AI at your service. Ask me anything.'));
 
-// 🔹 Command: /image <prompt>
+// /image command
 bot.command('image', async (ctx) => {
   const prompt = ctx.message.text.split(' ').slice(1).join(' ');
-  if (!prompt) return ctx.reply('❗ Please provide an image prompt.');
+  if (!prompt) return ctx.reply('⚠️ Please provide a prompt. Example:\n/image futuristic city at night');
 
   try {
     const res = await openai.images.generate({
       prompt,
       n: 1,
-      size: "512x512"
+      size: '512x512',
     });
 
-    const imageUrl = res.data[0].url;
-    ctx.replyWithPhoto(imageUrl, { caption: `🎨 Image for: "${prompt}"` });
+    ctx.replyWithPhoto(res.data[0].url);
   } catch (err) {
     console.error(err);
-    ctx.reply('❌ Error generating image.');
+    ctx.reply('❌ Failed to generate image.');
   }
 });
 
-// 🔹 Command: /code <language>\n<code>
+// /code command
 bot.command('code', async (ctx) => {
-  const text = ctx.message.text.split(' ').slice(1).join(' ');
-  const lang = text.split('\n')[0].toLowerCase();
-  const code = text.split('\n').slice(1).join('\n');
+  const input = ctx.message.text.split(' ').slice(1).join(' ');
+  if (!input) return ctx.reply('⚠️ Provide a code snippet. Example:\n/code console.log("Hello")');
 
-  if (!lang || !code) return ctx.reply('🧠 Usage: /code <language>\\n<code>');
-
-  try {
-    if (lang === 'js' || lang === 'javascript') {
-      const result = eval(code);
-      ctx.reply(`🧪 JS Output:\n${result}`);
-    } else if (lang === 'python' || lang === 'py') {
-      fs.writeFileSync('temp.py', code);
-      exec('python3 temp.py', (err, stdout, stderr) => {
-        if (err || stderr) return ctx.reply(`❌ Python Error:\n${stderr || err.message}`);
-        ctx.reply(`🐍 Python Output:\n${stdout}`);
-      });
-    } else {
-      ctx.reply('⚠️ Language not supported. Use js or python.');
+  let result = '';
+  if (input.includes('console.log') || input.includes('function')) {
+    // JavaScript
+    try {
+      result = eval(input);
+      ctx.reply(`✅ JS Result:\n${result}`);
+    } catch (e) {
+      ctx.reply(`❌ JS Error:\n${e.message}`);
     }
-  } catch (e) {
-    ctx.reply(`❌ Error:\n${e.message}`);
+  } else {
+    // Python (with subprocess)
+    const filename = path.join(__dirname, 'temp.py');
+    fs.writeFileSync(filename, input);
+    exec(`python3 ${filename}`, (err, stdout, stderr) => {
+      if (err || stderr) return ctx.reply(`❌ Python Error:\n${stderr || err.message}`);
+      ctx.reply(`✅ Python Result:\n${stdout}`);
+      fs.unlinkSync(filename);
+    });
   }
 });
 
-// 🔹 Command: /remember <key> = <value>
+// /remember <key> <value>
 bot.command('remember', (ctx) => {
-  const match = ctx.message.text.match(/\/remember\s+(\w+)\s*=\s*(.+)/);
-  if (!match) return ctx.reply('💾 Usage: /remember <key> = <value>');
-  const [, key, value] = match;
-  memory[key] = value;
-  ctx.reply(`✅ Remembered: ${key} = ${value}`);
+  const [, key, ...value] = ctx.message.text.split(' ');
+  if (!key || value.length === 0) return ctx.reply('❗ Usage: /remember name Shadow');
+  memory[key] = value.join(' ');
+  ctx.reply(`🧠 Remembered: ${key} = ${memory[key]}`);
 });
 
-// 🔹 Command: /recall <key>
+// /recall <key>
 bot.command('recall', (ctx) => {
   const key = ctx.message.text.split(' ')[1];
-  if (!key) return ctx.reply('🧠 Usage: /recall <key>');
+  if (!key) return ctx.reply('❗ Usage: /recall name');
   const value = memory[key];
-  ctx.reply(value ? `📌 ${key} = ${value}` : '❌ Not found.');
+  if (!value) return ctx.reply(`❌ Nothing remembered for: ${key}`);
+  ctx.reply(`🔍 ${key} = ${value}`);
 });
 
-// 🔹 Voice messages (speech to text)
+// Voice message → Transcribe with OpenAI
 bot.on('voice', async (ctx) => {
   try {
-    const file = await ctx.telegram.getFile(ctx.message.voice.file_id);
-    const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
-    const oggPath = './voice.ogg';
-    const mp3Path = './voice.mp3';
-
-    const writer = fs.createWriteStream(oggPath);
-    const res = await axios({ url: fileUrl, method: 'GET', responseType: 'stream' });
+    const fileLink = await ctx.telegram.getFileLink(ctx.message.voice.file_id);
+    const filePath = path.join(__dirname, 'audio.ogg');
+    const writer = fs.createWriteStream(filePath);
+    const res = await axios.get(fileLink.href, { responseType: 'stream' });
     res.data.pipe(writer);
-    await new Promise((resolve) => writer.on('finish', resolve));
 
-    await new Promise((resolve, reject) => {
-      exec(`ffmpeg -i ${oggPath} -ar 44100 -ac 2 -b:a 192k ${mp3Path}`, (err) => {
-        if (err) return reject(err);
-        resolve();
+    writer.on('finish', async () => {
+      const transcript = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(filePath),
+        model: 'whisper-1',
       });
-    });
 
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(mp3Path),
-      model: 'whisper-1'
+      ctx.reply(`🗣 Transcription:\n${transcript.text}`);
+      fs.unlinkSync(filePath);
     });
-
-    ctx.reply(`🎤 You said: ${transcription.text}`);
   } catch (err) {
     console.error(err);
-    ctx.reply('❌ Voice processing failed.');
+    ctx.reply('❌ Failed to transcribe audio.');
   }
 });
 
-// Launch
+// Catch-all text → AI Chat
+bot.on('text', async (ctx) => {
+  const userMessage = ctx.message.text;
+  try {
+    const completion = await openai.chat.completions.create({
+      messages: [{ role: 'user', content: userMessage }],
+      model: 'gpt-3.5-turbo'
+    });
+
+    const reply = completion.choices[0].message.content;
+    ctx.reply(reply);
+  } catch (err) {
+    console.error(err);
+    ctx.reply('❌ Failed to get response from Shadow.');
+  }
+});
+
+// Start bot
 bot.launch();
 console.log('🤖 Shadow bot is running...');
